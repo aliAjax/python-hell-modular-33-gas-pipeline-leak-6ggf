@@ -2,6 +2,8 @@ from .domain import DomainError
 
 ENTITY_TYPE = "pipeline_leak"
 INITIAL_STATUS = "reported"
+# 班组容量：同时在场隔离抢修的方案上限。占得到阀门但排不上班组的方案先进入排队。
+MAX_ACTIVE_JOBS = 2
 CREATE_ROLES = {"dispatcher", "responder"}
 SOURCE_ROLES = {"dispatcher", "responder", "patrol", "sensor"}
 ACTION_ROLES = {
@@ -100,7 +102,8 @@ def apply_action(item, action, payload, actor, role):
         return "restored", current, {"restoration": current["restoration"]}
 
     if action == "cancel":
-        _need_status(item, {"reported", "verified"})
+        # 尚未隔离、排队中或已隔离待修的方案都可以取消；取消即释放其占用的阀门并晋升排队。
+        _need_status(item, {"reported", "verified", "queued", "isolated"})
         reason = _text(payload, "reason")
         current["cancellation"] = {"reason": reason, "actor": actor}
         return "cancelled", current, {"reason": reason}

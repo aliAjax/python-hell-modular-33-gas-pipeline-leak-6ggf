@@ -2,10 +2,11 @@ from datetime import datetime
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, details=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.details = details or {}
 
 
 class ConflictError(DomainError):

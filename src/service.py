@@ -3,8 +3,10 @@ from .domain import DomainError
 
 
 class Service:
-    def __init__(self, repository):
+    def __init__(self, repository, max_active_jobs=None):
         self.repository = repository
+        if max_active_jobs is not None:
+            self.repository.max_active_jobs = max_active_jobs
 
     def create_item(self, payload, actor, role, region=None):
         if not actor or not role:

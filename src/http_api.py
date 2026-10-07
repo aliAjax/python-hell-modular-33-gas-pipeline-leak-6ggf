@@ -41,7 +41,11 @@ def build_handler(service, static_dir):
         def _error(self, exc):
             status = getattr(exc, "status", 500)
             code = getattr(exc, "code", "internal_error")
-            self._send(status, {"error": code, "message": str(exc)})
+            body = {"error": code, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                body["details"] = details
+            self._send(status, body)
 
         def do_GET(self):
             try:

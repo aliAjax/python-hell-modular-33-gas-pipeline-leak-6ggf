@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
@@ -11,8 +12,10 @@ def now_iso():
 
 
 class Repository:
-    def __init__(self, path):
+    def __init__(self, path, max_active_jobs=None):
         self.path = path
+        # 同时在场隔离抢修的方案上限；占得到阀门但排不上班组的方案进入排队。
+        self.max_active_jobs = max_active_jobs if max_active_jobs is not None else rules.MAX_ACTIVE_JOBS
 
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -70,6 +73,12 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS valves (
+                    valve_name TEXT PRIMARY KEY,
+                    held_by_item INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(held_by_item) REFERENCES items(id)
+                );
                 """
             )
         finally:
@@ -104,6 +113,80 @@ class Repository:
             "INSERT INTO audit_events(item_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
+
+    def _occupy_valves(self, conn, item_id, valves):
+        """按上游到下游顺序占位，原子操作。
+
+        任一阀门已被其他方案持有则抛 valve_occupied（不写任何阀门），由外层回滚。
+        一个阀门同一时间只归一个隔离方案；属地释放前抢占他人阀门一律拒绝。
+        """
+        holders = {}
+        if valves:
+            placeholders = ",".join("?" for _ in valves)
+            rows = conn.execute(
+                "SELECT valve_name, held_by_item FROM valves WHERE valve_name IN (%s)" % placeholders,
+                list(valves),
+            ).fetchall()
+            for row in rows:
+                holders[row["valve_name"]] = row["held_by_item"]
+        conflicts = []
+        for name in valves:  # 严格按上游→下游顺序核对并列出冲突
+            holder = holders.get(name)
+            if holder is not None and int(holder) != int(item_id):
+                conflicts.append({"valve": name, "held_by_item": holder})
+        if conflicts:
+            raise DomainError(
+                "valve_occupied",
+                "隔离方案不成立：阀门已被其他隔离方案占用",
+                409,
+                {"occupied_valves": conflicts},
+            )
+        ts = now_iso()
+        for name in valves:
+            conn.execute(
+                "INSERT OR REPLACE INTO valves(valve_name,held_by_item,updated_at) VALUES(?,?,?)",
+                (name, item_id, ts),
+            )
+
+    def _release_valves(self, conn, item_id):
+        conn.execute("DELETE FROM valves WHERE held_by_item=?", (item_id,))
+
+    def _active_count(self, conn):
+        row = conn.execute("SELECT COUNT(*) AS total FROM items WHERE status='isolated'").fetchone()
+        return row["total"]
+
+    def _promote_next(self, conn):
+        """释放一个班组名额后，按 FIFO 晋升队首方案；晋升前按当时阀门状态重新判断。
+
+        队首方案的阀门若仍被本方案持有则直接晋升；若被其他方案抢占（异常），
+        则保留排队、不跳号（不抢占后面方案的顺位）。
+        """
+        if self._active_count(conn) >= self.max_active_jobs:
+            return
+        row = conn.execute(
+            "SELECT id, version, payload FROM items WHERE status='queued' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return
+        item_id = row["id"]
+        payload = json.loads(row["payload"])
+        valves = payload.get("valve_sequence") or []
+        try:
+            self._occupy_valves(conn, item_id, valves)
+        except DomainError:
+            return  # 队首阀门被占，本轮不晋升；顺位保留，等下一次释放再判断
+        ts = now_iso()
+        cur = conn.execute(
+            "UPDATE items SET status='isolated', version=?, updated_at=? WHERE id=? AND status='queued'",
+            (int(row["version"]) + 1, ts, item_id),
+        )
+        if cur.rowcount != 1:
+            return  # 队首状态已变，未发生晋升，不记审计
+        conn.execute(
+            "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (item_id, "schedule", "system", "scheduler", canonical_json({"valve_sequence": valves}), ts),
+        )
+        self.append_audit(conn, item_id, "scheduled", "system", "scheduler", {"valve_sequence": valves})
 
     def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
         conn = self.connect()
@@ -217,10 +300,28 @@ class Repository:
             if expected_version is not None and int(expected_version) != int(row["version"]):
                 raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
             version = int(row["version"]) + 1
+
+            if action == "isolate":
+                # 原子占位：按上游→下游逐个核对，任一被占即回滚并列出被占阀门（方案不成立）。
+                valves = new_payload.get("valve_sequence") or []
+                self._occupy_valves(conn, item_id, valves)
+                # 占得到阀门后再看班组容量：排不上就进排队，顺位按提交先后。
+                if self._active_count(conn) >= self.max_active_jobs:
+                    new_status = "queued"
+                else:
+                    new_status = "isolated"
+
+            # 先更新本方案状态，释放类操作再据此归还阀门、晋升排队（此时名额才真正腾出）。
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
                 (new_status, version, canonical_json(new_payload), now_iso(), item_id),
             )
+
+            if action in ("restore", "cancel"):
+                # 属地释放：归还本方案占用的阀门，再按 FIFO 晋升排队方案。
+                self._release_valves(conn, item_id)
+                self._promote_next(conn)
+
             conn.execute(
                 "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
                 (item_id, action, actor, role, canonical_json(event_payload), now_iso()),
@@ -256,6 +357,41 @@ class Repository:
             counts = {}
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
-            return {"counts": counts, "items": self.list_items()}
+            valves = []
+            for row in conn.execute(
+                "SELECT v.valve_name, v.held_by_item, v.updated_at, i.payload, i.status "
+                "FROM valves v JOIN items i ON i.id = v.held_by_item ORDER BY v.valve_name"
+            ).fetchall():
+                payload = json.loads(row["payload"])
+                valves.append(
+                    {
+                        "valve": row["valve_name"],
+                        "held_by_item": row["held_by_item"],
+                        "segment_id": payload.get("segment_id"),
+                        "status": row["status"],
+                        "updated_at": row["updated_at"],
+                    }
+                )
+            queue = []
+            for row in conn.execute(
+                "SELECT id, payload, status, updated_at FROM items "
+                "WHERE status='queued' ORDER BY id"
+            ).fetchall():
+                payload = json.loads(row["payload"])
+                queue.append(
+                    {
+                        "item_id": row["id"],
+                        "segment_id": payload.get("segment_id"),
+                        "status": row["status"],
+                        "enqueued_at": row["updated_at"],
+                    }
+                )
+            return {
+                "counts": counts,
+                "items": self.list_items(),
+                "valves": valves,
+                "queue": queue,
+                "max_active_jobs": self.max_active_jobs,
+            }
         finally:
             conn.close()

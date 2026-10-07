@@ -11,6 +11,8 @@ def main():
     parser = argparse.ArgumentParser(description="燃气管线泄漏检测与隔离服务")
     parser.add_argument("--db", default=os.path.join(os.path.dirname(__file__), "data.db"))
     parser.add_argument("--port", type=int, default=8333)
+    parser.add_argument("--max-active-jobs", type=int, default=None,
+                        help="同时在场隔离抢修的方案上限；占得到阀门但排不上的方案进入排队")
     parser.add_argument("--init", action="store_true", help="initialize the database and exit")
     args = parser.parse_args()
 
@@ -20,7 +22,7 @@ def main():
         print("initialized: %s" % args.db)
         return
 
-    service = Service(repo)
+    service = Service(repo, max_active_jobs=args.max_active_jobs)
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), build_handler(service, static_dir))
     server.service = service

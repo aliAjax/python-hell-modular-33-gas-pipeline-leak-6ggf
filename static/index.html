@@ -1,5 +1,35 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>燃气管线泄漏响应</title><body><h1>燃气管线泄漏检测与隔离协调</h1><p>使用 JSON API 创建泄漏事件、登记巡检或传感记录，并完成核验、隔离、抢修、试压与恢复。</p><pre>GET /health
-GET /api/state
-POST /api/items
-POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>燃气管线泄漏响应</title><style>
+body{font-family:system-ui,"Segoe UI",sans-serif;margin:1.5rem;color:#1a1a1a}
+h1{font-size:1.3rem}
+h2{font-size:1.05rem;margin:1.2rem 0 .4rem}
+table{border-collapse:collapse;font-size:.88rem;width:100%}
+th,td{border:1px solid #d0d0d0;padding:.3rem .5rem;text-align:left}
+th{background:#f2f2f2}
+code{background:#f6f6f6;padding:.1rem .3rem;border-radius:3px}
+.muted{color:#777}
+</style></head><body><h1>燃气管线泄漏检测与隔离协调</h1>
+<p class="muted">阀门即资源：一个阀门同一时间只归一个隔离方案，提交时按上游到下游占位，占不到即方案不成立并列出被占阀门；班组容量有限，排不上先排队，释放后按 FIFO 重新判断阀门状态再晋升。</p>
+<p>接口：<code>GET /health</code> <code>GET /api/state</code> <code>POST /api/items</code> <code>POST /api/items/{id}/sources</code> <code>POST /api/items/{id}/actions</code></p>
+<h2>状态统计</h2><div id="counts">读取中…</div>
+<h2>阀门占用（一个阀门只归一个方案）</h2><div id="valves">读取中…</div>
+<h2>排队顺序（FIFO，轮到时按当时阀门状态判断）</h2><div id="queue">读取中…</div>
+<script>
+function table(rows,columns){
+  if(!rows.length)return '<p class="muted">无</p>';
+  var h='<table><tr>'+columns.map(function(c){return '<th>'+c.label+'</th>'}).join('')+'</tr>';
+  h+=rows.map(function(r){return '<tr>'+columns.map(function(c){return '<td>'+(r[c.key]==null?'':r[c.key])+'</td>'}).join('')+'</tr>'}).join('');
+  return h+'</table>';
+}
+function load(){
+  fetch('/api/state').then(function(r){return r.json()}).then(function(s){
+    var counts=Object.keys(s.counts||{}).map(function(k){return {status:k,total:s.counts[k]}});
+    document.getElementById('counts').innerHTML=table(counts,[{key:'status',label:'状态'},{key:'total',label:'数量'}])+
+      '<p class="muted">同时在场隔离上限 '+s.max_active_jobs+'</p>';
+    document.getElementById('valves').innerHTML=table(s.valves||[],[
+      {key:'valve',label:'阀门'},{key:'held_by_item',label:'持有方案'},{key:'segment_id',label:'管段'},{key:'status',label:'方案状态'}]);
+    document.getElementById('queue').innerHTML=table(s.queue||[],[
+      {key:'item_id',label:'排队顺位(方案ID)'},{key:'segment_id',label:'管段'},{key:'status',label:'状态'},{key:'enqueued_at',label:'入队时间'}]);
+  }).catch(function(e){document.getElementById('counts').textContent='读取失败：'+e});
+}
+load();setInterval(load,4000);
+</script></body></html>
