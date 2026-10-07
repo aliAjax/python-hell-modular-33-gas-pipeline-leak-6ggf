@@ -70,6 +70,20 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS valve_locks (
+                    valve_id TEXT PRIMARY KEY,
+                    item_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE TABLE IF NOT EXISTS work_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL UNIQUE,
+                    valve_sequence TEXT NOT NULL,
+                    queued_at TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
                 """
             )
         finally:
@@ -207,33 +221,244 @@ class Repository:
         finally:
             conn.close()
 
+    def _apply_action_core(self, conn, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version):
+        row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("item_not_found", "业务实体不存在")
+        if expected_version is not None and int(expected_version) != int(row["version"]):
+            raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+        version = int(row["version"]) + 1
+        conn.execute(
+            "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+            (new_status, version, canonical_json(new_payload), now_iso(), item_id),
+        )
+        conn.execute(
+            "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (item_id, action, actor, role, canonical_json(event_payload), now_iso()),
+        )
+        self.append_audit(conn, item_id, action, actor, role, event_payload)
+
+    def _rollback(self, conn):
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
     def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_action_core(conn, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version)
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            self._rollback(conn)
+            raise
+        finally:
+            conn.close()
+
+    def _valve_conflicts(self, conn, item_id, sequence):
+        conflicts = []
+        for valve_id in sequence:
+            row = conn.execute("SELECT item_id FROM valve_locks WHERE valve_id=?", (valve_id,)).fetchone()
+            if row is not None and row["item_id"] != item_id:
+                conflicts.append({"valve_id": valve_id, "held_by": row["item_id"]})
+        return conflicts
+
+    def _conflict_message(self, conflicts):
+        held = "、".join("%s(工单#%s)" % (entry["valve_id"], entry["held_by"]) for entry in conflicts)
+        return held
+
+    def _acquire_valves(self, conn, item_id, sequence):
+        for position, valve_id in enumerate(sequence):
+            conn.execute(
+                "INSERT INTO valve_locks(valve_id,item_id,position,created_at) VALUES(?,?,?,?)",
+                (valve_id, item_id, position, now_iso()),
+            )
+
+    def _release_valves(self, conn, item_id):
+        rows = conn.execute(
+            "SELECT valve_id FROM valve_locks WHERE item_id=? ORDER BY position", (item_id,)
+        ).fetchall()
+        conn.execute("DELETE FROM valve_locks WHERE item_id=?", (item_id,))
+        return [row["valve_id"] for row in rows]
+
+    def _active_crews(self, conn):
+        return conn.execute("SELECT COUNT(DISTINCT item_id) AS n FROM valve_locks").fetchone()["n"]
+
+    def isolate_item(self, item_id, sequence, actor, role, expected_version, crew_capacity, force=False):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
+            payload = json.loads(row["payload"])
+            sequence = list(sequence)
+            if row["status"] == "isolated" and payload.get("valve_sequence") == sequence:
+                conn.execute("COMMIT")
+                return self.get_item(item_id)
+            queued = conn.execute("SELECT valve_sequence FROM work_queue WHERE item_id=?", (item_id,)).fetchone()
+            if row["status"] == "queued" and queued and json.loads(queued["valve_sequence"]) == sequence:
+                conn.execute("COMMIT")
+                return self.get_item(item_id)
             if expected_version is not None and int(expected_version) != int(row["version"]):
                 raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+            if row["status"] != "verified":
+                raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % row["status"])
+            conflicts = self._valve_conflicts(conn, item_id, sequence)
+            if conflicts and force:
+                raise DomainError(
+                    "preempt_forbidden",
+                    "属地释放前禁止抢占阀门：%s" % self._conflict_message(conflicts),
+                    403,
+                )
             version = int(row["version"]) + 1
+            if self._active_crews(conn) >= crew_capacity:
+                conn.execute(
+                    "INSERT OR IGNORE INTO work_queue(item_id,valve_sequence,queued_at) VALUES(?,?,?)",
+                    (item_id, canonical_json(sequence), now_iso()),
+                )
+                conn.execute(
+                    "UPDATE items SET status=?,version=?,updated_at=? WHERE id=?",
+                    ("queued", version, now_iso(), item_id),
+                )
+                event = {"valve_sequence": sequence, "queued": True}
+                conn.execute(
+                    "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                    (item_id, "queue", actor, role, canonical_json(event), now_iso()),
+                )
+                self.append_audit(conn, item_id, "queued", actor, role, event)
+                conn.execute("COMMIT")
+                return self.get_item(item_id)
+            if conflicts:
+                raise ConflictError(
+                    "valve_unavailable",
+                    "隔离方案不成立，以下阀门被占用：%s" % self._conflict_message(conflicts),
+                )
+            payload["valve_sequence"] = sequence
+            payload.pop("isolation_rejection", None)
+            self._acquire_valves(conn, item_id, sequence)
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
-                (new_status, version, canonical_json(new_payload), now_iso(), item_id),
+                ("isolated", version, canonical_json(payload), now_iso(), item_id),
             )
+            event = {"valve_sequence": sequence}
             conn.execute(
                 "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
-                (item_id, action, actor, role, canonical_json(event_payload), now_iso()),
+                (item_id, "isolate", actor, role, canonical_json(event), now_iso()),
             )
-            self.append_audit(conn, item_id, action, actor, role, event_payload)
+            self.append_audit(conn, item_id, "isolate", actor, role, event)
             conn.execute("COMMIT")
             return self.get_item(item_id)
         except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
+            self._rollback(conn)
             raise
+        finally:
+            conn.close()
+
+    def _promote_queue(self, conn, crew_capacity):
+        while True:
+            if self._active_crews(conn) >= crew_capacity:
+                return
+            entry = conn.execute("SELECT * FROM work_queue ORDER BY id LIMIT 1").fetchone()
+            if entry is None:
+                return
+            item_id = entry["item_id"]
+            sequence = json.loads(entry["valve_sequence"])
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None or row["status"] != "queued":
+                conn.execute("DELETE FROM work_queue WHERE id=?", (entry["id"],))
+                continue
+            payload = json.loads(row["payload"])
+            version = int(row["version"]) + 1
+            conflicts = self._valve_conflicts(conn, item_id, sequence)
+            if conflicts:
+                payload["isolation_rejection"] = {"blocked_valves": conflicts}
+                conn.execute(
+                    "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                    ("verified", version, canonical_json(payload), now_iso(), item_id),
+                )
+                conn.execute("DELETE FROM work_queue WHERE id=?", (entry["id"],))
+                event = {"valve_sequence": sequence, "blocked_valves": conflicts}
+                conn.execute(
+                    "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                    (item_id, "isolation_rejected", "scheduler", "system", canonical_json(event), now_iso()),
+                )
+                self.append_audit(conn, item_id, "isolation_rejected", "scheduler", "system", event)
+                continue
+            payload["valve_sequence"] = sequence
+            payload.pop("isolation_rejection", None)
+            self._acquire_valves(conn, item_id, sequence)
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                ("isolated", version, canonical_json(payload), now_iso(), item_id),
+            )
+            conn.execute("DELETE FROM work_queue WHERE id=?", (entry["id"],))
+            event = {"valve_sequence": sequence, "promoted": True}
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, "isolate", "scheduler", "system", canonical_json(event), now_iso()),
+            )
+            self.append_audit(conn, item_id, "isolate", "scheduler", "system", event)
+
+    def restore_item(self, item_id, actor, role, new_status, new_payload, event_payload, expected_version, crew_capacity):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_action_core(conn, item_id, "restore", actor, role, new_status, new_payload, event_payload, expected_version)
+            released = self._release_valves(conn, item_id)
+            if released:
+                self.append_audit(conn, item_id, "valves_released", actor, role, {"valves": released})
+            self._promote_queue(conn, crew_capacity)
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            self._rollback(conn)
+            raise
+        finally:
+            conn.close()
+
+    def cancel_item(self, item_id, actor, role, new_status, new_payload, event_payload, expected_version):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_action_core(conn, item_id, "cancel", actor, role, new_status, new_payload, event_payload, expected_version)
+            conn.execute("DELETE FROM work_queue WHERE item_id=?", (item_id,))
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            self._rollback(conn)
+            raise
+        finally:
+            conn.close()
+
+    def valves_held(self, item_id):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT valve_id FROM valve_locks WHERE item_id=? ORDER BY position", (item_id,)
+            ).fetchall()
+            return [row["valve_id"] for row in rows]
+        finally:
+            conn.close()
+
+    def queued_sequence(self, item_id):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT valve_sequence FROM work_queue WHERE item_id=?", (item_id,)).fetchone()
+            return json.loads(row["valve_sequence"]) if row else None
+        finally:
+            conn.close()
+
+    def queue_position(self, item_id):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT id FROM work_queue WHERE item_id=?", (item_id,)).fetchone()
+            if row is None:
+                return None
+            ahead = conn.execute("SELECT COUNT(*) AS n FROM work_queue WHERE id<?", (row["id"],)).fetchone()["n"]
+            return ahead + 1
         finally:
             conn.close()
 
@@ -256,6 +481,19 @@ class Repository:
             counts = {}
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
-            return {"counts": counts, "items": self.list_items()}
+            locks = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT valve_id,item_id,position,created_at FROM valve_locks ORDER BY item_id,position"
+                ).fetchall()
+            ]
+            queue = []
+            for row in conn.execute(
+                "SELECT id,item_id,valve_sequence,queued_at FROM work_queue ORDER BY id"
+            ).fetchall():
+                entry = dict(row)
+                entry["valve_sequence"] = json.loads(entry["valve_sequence"])
+                queue.append(entry)
+            return {"counts": counts, "items": self.list_items(), "valve_locks": locks, "queue": queue}
         finally:
             conn.close()

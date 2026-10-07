@@ -45,6 +45,18 @@ def _text(payload, name):
     return value.strip()
 
 
+def valve_sequence_from(payload):
+    sequence = payload.get("valve_sequence")
+    if not isinstance(sequence, list) or len(sequence) < 2:
+        raise DomainError("valve_sequence_required", "至少需要提交两个阀门及顺序")
+    if not all(isinstance(value, str) and value.strip() for value in sequence):
+        raise DomainError("invalid_valve_sequence", "阀门顺序格式无效")
+    sequence = [value.strip() for value in sequence]
+    if len(set(sequence)) != len(sequence):
+        raise DomainError("duplicate_valve", "阀门顺序中存在重复阀门")
+    return sequence
+
+
 def apply_action(item, action, payload, actor, role):
     status = item["status"]
     current = dict(item["payload"])
@@ -62,14 +74,9 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "isolate":
         _need_status(item, {"verified"})
-        sequence = payload.get("valve_sequence")
-        if not isinstance(sequence, list) or len(sequence) < 2:
-            raise DomainError("valve_sequence_required", "至少需要提交两个阀门及顺序")
         if current.get("valve_status_conflict"):
             raise DomainError("valve_status_conflict", "阀门状态存在冲突，不能隔离", 409)
-        if not all(isinstance(value, str) and value.strip() for value in sequence):
-            raise DomainError("invalid_valve_sequence", "阀门顺序格式无效")
-        current["valve_sequence"] = [value.strip() for value in sequence]
+        current["valve_sequence"] = valve_sequence_from(payload)
         return "isolated", current, {"valve_sequence": current["valve_sequence"]}
 
     if action == "repair":
@@ -100,7 +107,7 @@ def apply_action(item, action, payload, actor, role):
         return "restored", current, {"restoration": current["restoration"]}
 
     if action == "cancel":
-        _need_status(item, {"reported", "verified"})
+        _need_status(item, {"reported", "verified", "queued"})
         reason = _text(payload, "reason")
         current["cancellation"] = {"reason": reason, "actor": actor}
         return "cancelled", current, {"reason": reason}

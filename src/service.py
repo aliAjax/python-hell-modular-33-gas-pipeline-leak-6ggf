@@ -3,8 +3,9 @@ from .domain import DomainError
 
 
 class Service:
-    def __init__(self, repository):
+    def __init__(self, repository, crew_capacity=2):
         self.repository = repository
+        self.crew_capacity = max(1, int(crew_capacity))
 
     def create_item(self, payload, actor, role, region=None):
         if not actor or not role:
@@ -49,21 +50,52 @@ class Service:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
+        if action == "isolate":
+            return self._isolate(item, payload, actor, role, expected_version)
         new_status, new_payload, event_payload = rules.apply_action(item, action, payload, actor, role)
-        self.repository.apply_action(
-            item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
-        )
+        if action == "restore":
+            self.repository.restore_item(
+                item_id, actor, role, new_status, new_payload, event_payload, expected_version, self.crew_capacity
+            )
+        elif action == "cancel":
+            self.repository.cancel_item(
+                item_id, actor, role, new_status, new_payload, event_payload, expected_version
+            )
+        else:
+            self.repository.apply_action(
+                item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
+            )
         return self.get_item(item_id)
+
+    def _isolate(self, item, payload, actor, role, expected_version):
+        sequence = rules.valve_sequence_from(payload)
+        if item["status"] == "isolated" and item["payload"].get("valve_sequence") == sequence:
+            return self.get_item(item["id"])
+        if item["status"] == "queued" and self.repository.queued_sequence(item["id"]) == sequence:
+            return self.get_item(item["id"])
+        if item["status"] != "verified":
+            raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % item["status"])
+        if item["payload"].get("valve_status_conflict"):
+            raise DomainError("valve_status_conflict", "阀门状态存在冲突，不能隔离", 409)
+        force = bool(payload.get("force") or payload.get("preempt"))
+        self.repository.isolate_item(
+            item["id"], sequence, actor, role, expected_version, self.crew_capacity, force
+        )
+        return self.get_item(item["id"])
 
     def get_item(self, item_id):
         item = self.repository.get_item(item_id)
         item["sources"] = self.repository.list_sources(item_id)
         item["audit"] = self.repository.audit_trail(item_id)
         item["assessment"] = rules.assess(item["payload"])
+        item["valves_held"] = self.repository.valves_held(item_id)
+        item["queue_position"] = self.repository.queue_position(item_id)
         return item
 
     def list_items(self, status=None):
         return self.repository.list_items(status)
 
     def state(self):
-        return self.repository.state_summary()
+        summary = self.repository.state_summary()
+        summary["crew_capacity"] = self.crew_capacity
+        return summary
